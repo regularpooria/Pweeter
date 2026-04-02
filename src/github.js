@@ -1,23 +1,25 @@
+const UPSTREAM_REPO = "regularpooria/pweeter";
+
 /**
  * Helper to fetch from GitHub API
  */
-async function ghFetch(repo, endpoint, token, options = {}) {
-  const url = `https://api.github.com/repos/${repo}${endpoint}`;
+async function ghFetch(endpoint, token, options = {}, isFullUrl = false) {
+  const url = isFullUrl ? endpoint : `https://api.github.com${endpoint}`;
   const res = await fetch(url, {
     ...options,
     headers: {
-      "Accept": "application/vnd.github.v3+json",
-      "Authorization": `token ${token}`,
+      Accept: "application/vnd.github.v3+json",
+      Authorization: `token ${token}`,
       "Content-Type": "application/json",
-      ...(options.headers || {})
-    }
+      ...(options.headers || {}),
+    },
   });
-  
+
   if (!res.ok) {
     const err = await res.text();
     throw new Error(`GitHub API Error (${res.status}): ${err}`);
   }
-  
+
   return res.json();
 }
 
@@ -25,116 +27,106 @@ async function ghFetch(repo, endpoint, token, options = {}) {
  * Fetches the bootstrap snapshot JSON off GitHub Pages
  */
 export async function fetchBootstrapSnapshot() {
-  const targetRepo = localStorage.getItem('github_target_repo');
-  if (!targetRepo) return [];
-  
-  console.log(`Fetching bootstrap snapshot from https://${targetRepo.split('/')[0]}.github.io/${targetRepo.split('/')[1]}/snapshot.json...`);
-  
+  console.log(`Fetching bootstrap snapshot from upstream...`);
   try {
-    // Attempt to pull from the GitHub Pages URL
-    const res = await fetch(`https://${targetRepo.split('/')[0]}.github.io/${targetRepo.split('/')[1]}/snapshot.json?t=${Date.now()}`);
-    if (res.ok) {
-        return await res.json();
-    }
-    
-    // Fallback: If not on pages yet, pull raw from main branch
-    const rawRes = await fetch(`https://raw.githubusercontent.com/${targetRepo}/main/snapshot.json?t=${Date.now()}`);
+    const rawRes = await fetch(
+      `https://raw.githubusercontent.com/${UPSTREAM_REPO}/main/snapshot.json?t=${Date.now()}`
+    );
     if (rawRes.ok) {
-        return await rawRes.json();
+      return await rawRes.json();
     }
-  } catch(e) {
-    console.error('Failed to fetch snapshot on bootstrap. Initializing genesis state.', e);
+  } catch (e) {
+    console.error(
+      "Failed to fetch snapshot on bootstrap. Initializing genesis state.",
+      e
+    );
   }
-  
   return [];
 }
-
-/**
- * Validates logs and pushes PR with JSON updates.
- * Requires auth token for API calls.
- */
 export async function createSnapshotPR(logs, token) {
-  if (!token) {
-    throw new Error('Not authorized for PR creation');
-  }
-  
-  const repo = localStorage.getItem('github_target_repo');
-  if (!repo) {
-    throw new Error('No target repo configured (Check GitHub Auth settings)');
-  }
-  
-  console.log('Crafting snapshot PR to ' + repo + '...');
+  if (!token) throw new Error("Not authorized for PR creation");
 
   try {
-    // 1. Get the current main branch reference SHA
-    const refData = await ghFetch(repo, '/git/refs/heads/main', token);
+    console.log("1. Fetching your GitHub username...");
+    const user = await ghFetch("/user", token);
+    const username = user.login;
+
+    console.log(`2. Forking ${UPSTREAM_REPO} to ${username}...`);
+    await ghFetch(`/repos/${UPSTREAM_REPO}/forks`, token, { method: "POST" });
+
+    // Wait a moment for GitHub to process the fork
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    const forkRepo = `${username}/pweeter`;
+    console.log(`3. Crafting snapshot update on ${forkRepo}...`);
+
+    // 1. Get the current main branch reference SHA from the fork
+    const refData = await ghFetch(
+      `/repos/${forkRepo}/git/refs/heads/main`,
+      token
+    );
     const mainSha = refData.object.sha;
 
     // 2. Create the blob for `snapshot.json`
-    const blobData = await ghFetch(repo, '/git/blobs', token, {
-      method: 'POST',
+    const blobData = await ghFetch(`/repos/${forkRepo}/git/blobs`, token, {
+      method: "POST",
       body: JSON.stringify({
         content: JSON.stringify(logs, null, 2),
-        encoding: 'utf-8'
-      })
+        encoding: "utf-8",
+      }),
     });
-    const blobSha = blobData.sha;
 
-    // 3. Create a tree containing the new blob based on the main tree
-    const treeData = await ghFetch(repo, '/git/trees', token, {
-      method: 'POST',
+    // 3. Create a tree containing the new blob
+    const treeData = await ghFetch(`/repos/${forkRepo}/git/trees`, token, {
+      method: "POST",
       body: JSON.stringify({
         base_tree: mainSha,
         tree: [
           {
-            path: 'snapshot.json',
-            mode: '100644', // File
-            type: 'blob',
-            sha: blobSha
-          }
-        ]
-      })
+            path: "snapshot.json",
+            mode: "100644", // File
+            type: "blob",
+            sha: blobData.sha,
+          },
+        ],
+      }),
     });
-    const treeSha = treeData.sha;
 
-    // 4. Create a commit pointing to the new tree
-    const commitData = await ghFetch(repo, '/git/commits', token, {
-      method: 'POST',
+    // 4. Create a commit
+    const commitData = await ghFetch(`/repos/${forkRepo}/git/commits`, token, {
+      method: "POST",
       body: JSON.stringify({
-        message: `chore: Decentralized network snapshot update (${logs.length} Pweets)`,
-        tree: treeSha,
-        parents: [mainSha]
-      })
+        message: `chore: Snapshot update (${logs.length} Pweets)`,
+        tree: treeData.sha,
+        parents: [mainSha],
+      }),
     });
-    const newCommitSha = commitData.sha;
 
     // 5. Create a new branch pointing to the new commit
-    const newBranchName = `refs/heads/snapshot-${Date.now()}`;
-    await ghFetch(repo, '/git/refs', token, {
-      method: 'POST',
+    const newBranchName = `snapshot-${Date.now()}`;
+    await ghFetch(`/repos/${forkRepo}/git/refs`, token, {
+      method: "POST",
       body: JSON.stringify({
-        ref: newBranchName,
-        sha: newCommitSha
-      })
+        ref: `refs/heads/${newBranchName}`,
+        sha: commitData.sha,
+      }),
     });
 
-    // 6. Create a Pull Request from the new branch to main
-    const prData = await ghFetch(repo, '/pulls', token, {
-      method: 'POST',
+    console.log(`4. Opening Pull Request to ${UPSTREAM_REPO}...`);
+    // 6. Create a Pull Request from the fork's new branch to upstream main
+    const prData = await ghFetch(`/repos/${UPSTREAM_REPO}/pulls`, token, {
+      method: "POST",
       body: JSON.stringify({
-        title: `Automatic Snapshot Sync (${logs.length} events recorded)`,
-        head: newBranchName.replace('refs/heads/', ''),
-        base: 'main',
-        body: `This PR was automatically generated by a Pweeter Node during a consensus round.\n\nIt contains **${logs.length}** decentralized log entries.\nMerge to automatically deploy the new snapshot to GitHub pages.`
-      })
+        title: `P2P Snapshot Sync (${logs.length} events)`,
+        head: `${username}:${newBranchName}`,
+        base: "main",
+        body: `Automated PR from Pweeter node.\n\nContains **${logs.length}** decentralized log entries.`,
+      }),
     });
 
-    console.log('✅ PR Created successfully:', prData.html_url);
-    alert(`Snapshot PR Created! Merge it here:\n${prData.html_url}`);
-    
     return prData;
   } catch (err) {
-    console.error('Snapshot PR Creation Failed:', err);
+    console.error("Snapshot PR Creation Failed:", err);
     alert(`Failed to create PR: ${err.message}`);
     throw err;
   }

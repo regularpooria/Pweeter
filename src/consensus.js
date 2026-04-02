@@ -59,10 +59,10 @@ export async function initiateSnapshotConsensus() {
     console.log("We are the leader! Submitting PR...");
     const token = localStorage.getItem("github_token");
     if (!token) {
-        console.warn("But we lack a github_token to finalize the PR!");
-        return false;
+      console.warn("But we lack a github_token to finalize the PR!");
+      return false;
     }
-    
+
     const logs = await getAllLogs();
     await createSnapshotPR(logs, token);
     return true;
